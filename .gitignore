@@ -1,0 +1,18 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+venv/
+.env/
+.venv/
+
+# 编辑器配置
+.vscode/
+.idea/
+
+# 日志 & 本地配置 & 哈希数据库
+config.json
+copy_log.txt
+file_hash.json
