@@ -1,4 +1,4 @@
-```markdown
+markdown
 # 文件增量复制工具（Modern Incremental Copy Tool）
 一个基于 **PySide6** 开发的现代化 GUI 文件增量复制工具。  
 它能够根据规则自动判断文件是否需要复制，并提供丝滑的暗色毛玻璃 UI、任务进度展示、传输组管理系统等功能。
