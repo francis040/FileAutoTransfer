@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QProgressBar, QFrame,
     QComboBox, QMessageBox, QCheckBox, QSizePolicy,
-    QDialog, QLineEdit
+    QDialog, QLineEdit, QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QHeaderView
 )
 
 # ========== 配置部分 ==========
@@ -143,6 +144,22 @@ class FileCopyManager:
             for name in filenames:
                 files.append(os.path.join(root, name))
         return files
+
+    def _same_drive(self, path_a: str, path_b: str) -> bool:
+        """判断是否同一盘符（Windows）"""
+        drive_a = os.path.splitdrive(os.path.abspath(path_a))[0].lower()
+        drive_b = os.path.splitdrive(os.path.abspath(path_b))[0].lower()
+        return bool(drive_a) and drive_a == drive_b
+
+    def _generate_unique_target(self, target_file: str) -> str:
+        """生成不冲突的新目标文件名"""
+        base, ext = os.path.splitext(target_file)
+        index = 1
+        while True:
+            candidate = f"{base} ({index}){ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            index += 1
 
     # ---------- 判定是否需要复制 ----------
 
@@ -332,6 +349,7 @@ class FileCopyManager:
                     pass
 
                 # 严格模式下记录哈希
+                dst_hash = None
                 if self.detection_mode == "hash":
                     dst_hash = self.get_file_hash(target_file)
                     if dst_hash:
@@ -339,11 +357,33 @@ class FileCopyManager:
 
                 # 如果开启了“复制后删除源文件”
                 if self.delete_after_copy:
+                    can_delete = False
                     try:
-                        os.remove(source_file)
-                        self.log(f"已删除源文件: {source_file}")
+                        if os.path.exists(source_file) and os.path.exists(target_file):
+                            src_size = os.path.getsize(source_file)
+                            dst_size = os.path.getsize(target_file)
+                            if src_size == dst_size:
+                                if self.detection_mode == "hash":
+                                    src_hash = self.get_file_hash(source_file)
+                                    if src_hash and dst_hash and src_hash == dst_hash:
+                                        can_delete = True
+                                    else:
+                                        self.log(f"源目标哈希不一致，取消删除源文件: {source_file}")
+                                else:
+                                    can_delete = True
+                            else:
+                                self.log(f"源目标大小不一致，取消删除源文件: {source_file}")
+                        else:
+                            self.log(f"源或目标不存在，取消删除源文件: {source_file}")
                     except Exception as e:
-                        self.log(f"删除源文件失败: {source_file} - {e}")
+                        self.log(f"删除前校验失败: {source_file} - {e}")
+
+                    if can_delete:
+                        try:
+                            os.remove(source_file)
+                            self.log(f"已删除源文件: {source_file}")
+                        except Exception as e:
+                            self.log(f"删除源文件失败: {source_file} - {e}")
 
                 return True, "复制成功"
 
@@ -449,6 +489,142 @@ class FileCopyManager:
         summary = (
             "复制完成！\n\n"
             f"复制: {copied} 个文件\n"
+            f"跳过: {skipped} 个文件\n"
+            f"失败: {failed} 个文件\n\n"
+            f"日志文件: {LOG_FILE}"
+        )
+        complete_callback(summary)
+
+    def start_move(self,
+                   progress_callback,
+                   status_callback,
+                   file_progress_callback,
+                   complete_callback,
+                   conflict_callback):
+        """
+        文件移动流程：
+        - 同盘优先使用 os.replace 进行快速移动
+        - 跨盘回退为复制 + 完整校验 + 删除源文件
+        """
+        self.pause_flag = False
+        self.stop_flag = False
+
+        self.log("=" * 50)
+        self.log("开始文件移动")
+        self.log(f"源目录: {self.source_dir}")
+        self.log(f"目标目录: {self.target_dir}")
+
+        files = self.get_all_files(self.source_dir)
+        total = len(files)
+
+        if total == 0:
+            self.log("源目录中没有文件")
+            complete_callback("源目录中没有文件")
+            return
+
+        self.log(f"找到 {total} 个文件")
+
+        moved = 0
+        skipped = 0
+        failed = 0
+
+        for index, source_file in enumerate(files, 1):
+            if self.stop_flag:
+                self.log("用户停止了移动过程")
+                complete_callback(
+                    f"已停止。移动: {moved}, 跳过: {skipped}, 失败: {failed}"
+                )
+                return
+
+            while self.pause_flag and not self.stop_flag:
+                time.sleep(0.1)
+
+            rel_path = os.path.relpath(source_file, self.source_dir)
+            target_file = os.path.join(self.target_dir, rel_path)
+            file_name = os.path.basename(source_file)
+
+            status_callback(f"处理中: {file_name}", source_file)
+            progress_callback(int(index * 100 / total), f"{index}/{total}")
+            file_progress_callback(0, file_name, "移动中", 0)
+
+            if os.path.exists(target_file):
+                action = conflict_callback(source_file, target_file)
+                if action == "cancel":
+                    self.stop_flag = True
+                    self.log("用户取消了移动过程")
+                    complete_callback(
+                        f"已停止。移动: {moved}, 跳过: {skipped}, 失败: {failed}"
+                    )
+                    return
+                if action == "skip":
+                    self.log(f"≈ 跳过: {rel_path} (目标已存在)")
+                    file_progress_callback(100, file_name, "已跳过", 0)
+                    skipped += 1
+                    continue
+                if action == "rename":
+                    target_file = self._generate_unique_target(target_file)
+
+            try:
+                os.makedirs(os.path.dirname(target_file), exist_ok=True)
+            except Exception as e:
+                self.log(f"! 失败: {rel_path} - {e}")
+                file_progress_callback(0, file_name, f"失败: {e}", 0)
+                failed += 1
+                continue
+
+            if self._same_drive(source_file, target_file):
+                try:
+                    os.replace(source_file, target_file)
+                    self.log(f"⇄ 移动: {rel_path}")
+                    file_progress_callback(100, file_name, "移动完成", 0)
+                    moved += 1
+                except Exception as e:
+                    self.log(f"! 失败: {rel_path} - {e}")
+                    file_progress_callback(0, file_name, f"失败: {e}", 0)
+                    failed += 1
+            else:
+                if os.path.exists(target_file):
+                    if os.path.isdir(target_file):
+                        self.log(f"! 失败: {rel_path} - 目标为目录，无法覆盖")
+                        file_progress_callback(0, file_name, "失败: 目标为目录", 0)
+                        failed += 1
+                        continue
+                    try:
+                        os.remove(target_file)
+                    except Exception as e:
+                        self.log(f"! 失败: {rel_path} - 无法删除目标文件: {e}")
+                        file_progress_callback(0, file_name, f"失败: {e}", 0)
+                        failed += 1
+                        continue
+
+                prev_delete = self.delete_after_copy
+                self.delete_after_copy = True
+                success, msg = self.copy_file_with_progress(
+                    source_file, target_file,
+                    lambda p, s: file_progress_callback(p, file_name, "移动中", s)
+                )
+                self.delete_after_copy = prev_delete
+
+                if success is True:
+                    self.log(f"⇄ 移动: {rel_path}")
+                    file_progress_callback(100, file_name, "移动完成", 0)
+                    moved += 1
+                elif success is None:
+                    self.log(f"⟲ 已取消: {rel_path} - {msg}")
+                    file_progress_callback(0, file_name, "已取消", 0)
+                else:
+                    self.log(f"! 失败: {rel_path} - {msg}")
+                    file_progress_callback(0, file_name, f"失败: {msg}", 0)
+                    failed += 1
+
+        self.save_hash_db()
+
+        self.log("=" * 50)
+        self.log(f"移动完成 - 移动: {moved}, 跳过: {skipped}, 失败: {failed}")
+
+        summary = (
+            "移动完成！\n\n"
+            f"移动: {moved} 个文件\n"
             f"跳过: {skipped} 个文件\n"
             f"失败: {failed} 个文件\n\n"
             f"日志文件: {LOG_FILE}"
@@ -623,6 +799,67 @@ class CardQuestionDialog(QDialog):
         return result == QDialog.Accepted
 
 
+# ======== 深色卡片式“多选项”对话框 ========
+
+class CardChoiceDialog(QDialog):
+    """深色卡片风格的多选项对话框，返回选中的 value"""
+
+    def __init__(self, parent, title: str, text: str, choices):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setModal(True)
+
+        self._choice = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame()
+        card.setObjectName("card")
+        outer.addWidget(card)
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("sectionTitle")
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(title_label)
+
+        msg_label = QLabel(text)
+        msg_label.setWordWrap(True)
+        layout.addWidget(msg_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        for label, value in choices:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _, v=value: self._select(v))
+            btn_row.addWidget(btn)
+        layout.addLayout(btn_row)
+
+    def _select(self, value):
+        self._choice = value
+        self.accept()
+
+    @staticmethod
+    def ask(parent, title: str, text: str, choices):
+        dlg = CardChoiceDialog(parent, title, text, choices)
+        dlg.adjustSize()
+        if parent is not None:
+            g = parent.frameGeometry()
+            rect = dlg.frameGeometry()
+            rect.moveCenter(g.center())
+            dlg.move(rect.topLeft())
+        result = dlg.exec()
+        if result == QDialog.Accepted:
+            return dlg._choice
+        return "cancel"
+
+
 class PresetManagerDialog(QWidget):
     """传输组管理器弹窗"""
 
@@ -653,10 +890,23 @@ class PresetManagerDialog(QWidget):
         title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         card_layout.addWidget(title)
 
-        # 下拉列表展示已有的传输组
-        self.combo = QComboBox()
-        self._refresh_combo()
-        card_layout.addWidget(self.combo)
+        # 表格展示已有的传输组
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["名称", "源目录", "目标目录"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.doubleClicked.connect(self.apply_current)
+        self._refresh_table()
+        card_layout.addWidget(self.table)
 
         # 按钮区
         btn_row = QHBoxLayout()
@@ -679,16 +929,20 @@ class PresetManagerDialog(QWidget):
 
         outer_layout.addWidget(card)
 
-    def _refresh_combo(self):
-        """刷新下拉框内容"""
-        self.combo.clear()
+    def _refresh_table(self):
+        """刷新表格内容"""
+        self.table.setRowCount(0)
         if not self.presets:
-            self.combo.addItem("（暂无传输组）")
-            self.combo.setEnabled(False)
-        else:
-            self.combo.setEnabled(True)
-            for p in self.presets:
-                self.combo.addItem(p.get("name", "未命名"))
+            return
+        for row, p in enumerate(self.presets):
+            self.table.insertRow(row)
+            name = p.get("name", "未命名")
+            source = p.get("source", "")
+            target = p.get("target", "")
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            self.table.setItem(row, 1, QTableWidgetItem(source))
+            self.table.setItem(row, 2, QTableWidgetItem(target))
+        self.table.selectRow(0)
 
     def create_new(self):
         """新建一个传输组：输入名称 + 选择源目录 + 选择目标目录"""
@@ -711,15 +965,21 @@ class PresetManagerDialog(QWidget):
         }
         self.presets.append(preset)
         ConfigManager.save_config(self.config)
-        self._refresh_combo()
+        self._refresh_table()
         CardMessageDialog.show_message(self, "已保存", "传输组已保存。")
+
+    def _get_selected_index(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.presets):
+            return -1
+        return row
 
     def delete_current(self):
         """删除当前选中的传输组"""
         if not self.presets:
             return
 
-        idx = self.combo.currentIndex()
+        idx = self._get_selected_index()
         if idx < 0 or idx >= len(self.presets):
             return
 
@@ -730,13 +990,13 @@ class PresetManagerDialog(QWidget):
 
         self.presets.pop(idx)
         ConfigManager.save_config(self.config)
-        self._refresh_combo()
+        self._refresh_table()
 
-    def apply_current(self):
+    def apply_current(self, _index=None):
         """把当前传输组应用到主界面"""
         if not self.presets:
             return
-        idx = self.combo.currentIndex()
+        idx = self._get_selected_index()
         if idx < 0 or idx >= len(self.presets):
             return
 
@@ -744,7 +1004,7 @@ class PresetManagerDialog(QWidget):
         parent = self.parent()
         if isinstance(parent, ModernWindow):
             parent.apply_preset(p)
-            CardMessageDialog.show_message(self, "已应用", "传输组已应用到主界面。")
+            self.close()
 
 
 class ModernWindow(QMainWindow):
@@ -762,6 +1022,9 @@ class ModernWindow(QMainWindow):
 
         # 子线程 -> UI 的消息队列
         self.queue: "queue.Queue[tuple]" = queue.Queue()
+        self._current_action = "复制"
+        self._conflict_event = threading.Event()
+        self._conflict_response = None
 
         # 拖动无边框窗口相关
         self._dragging = False
@@ -880,6 +1143,36 @@ class ModernWindow(QMainWindow):
                 border-radius: 6px;
                 selection-background-color: #4aa3ff;
                 color: #f0f0f0;
+            }
+            QTableWidget {
+                background-color: rgba(32, 32, 32, 220);
+                color: #e0e0e0;
+                gridline-color: #3a3a3a;
+                border: 1px solid #4a4a4a;
+                border-radius: 10px;
+                selection-background-color: #4aa3ff;
+                selection-color: #101010;
+            }
+            QTableWidget::item {
+                padding: 4px 6px;
+                background-color: rgba(35, 35, 35, 220);
+            }
+            QTableWidget::item:alternate {
+                background-color: rgba(45, 45, 45, 220);
+            }
+            QTableWidget::item:selected {
+                background-color: #4aa3ff;
+                color: #101010;
+            }
+            QHeaderView::section {
+                background-color: #2f2f2f;
+                color: #dcdcdc;
+                border: 1px solid #3a3a3a;
+                padding: 6px 8px;
+            }
+            QTableCornerButton::section {
+                background-color: #2f2f2f;
+                border: 1px solid #3a3a3a;
             }
             QCheckBox {
                 color: #d0d0d0;
@@ -1115,6 +1408,9 @@ class ModernWindow(QMainWindow):
         self.btn_start = QPushButton("开始复制")
         self.btn_start.clicked.connect(self.start_copy)
 
+        self.btn_move = QPushButton("开始移动")
+        self.btn_move.clicked.connect(self.start_move)
+
         self.btn_pause = QPushButton("暂停")
         self.btn_pause.setEnabled(False)
         self.btn_pause.clicked.connect(self.toggle_pause)
@@ -1139,6 +1435,7 @@ class ModernWindow(QMainWindow):
         self.chk_delete_after.stateChanged.connect(self.on_delete_after_changed)
 
         btn_row.addWidget(self.btn_start)
+        btn_row.addWidget(self.btn_move)
         btn_row.addWidget(self.btn_pause)
         btn_row.addWidget(self.btn_stop)
         btn_row.addSpacing(16)
@@ -1367,7 +1664,9 @@ class ModernWindow(QMainWindow):
         )
 
         # 按钮状态
+        self._current_action = "复制"
         self.btn_start.setEnabled(False)
+        self.btn_move.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_pause.setText("暂停")
         self.btn_stop.setEnabled(True)
@@ -1385,9 +1684,10 @@ class ModernWindow(QMainWindow):
         self.manager = FileCopyManager(
             self.source_dir, self.target_dir, detection_mode
         )
-        self.manager.delete_after_copy = self.config.get(
-            "delete_after_copy", False
-        )
+        delete_after = self.chk_delete_after.isChecked()
+        self.manager.delete_after_copy = delete_after
+        self.config["delete_after_copy"] = delete_after
+        ConfigManager.save_config(self.config)
 
         # 开新线程执行复制，避免卡 UI
         self.copy_thread = threading.Thread(
@@ -1406,6 +1706,61 @@ class ModernWindow(QMainWindow):
                 complete_callback=self._copy_complete,
             )
 
+    def start_move(self):
+        """开始移动按钮"""
+        if not self.source_dir or not os.path.exists(self.source_dir):
+            CardMessageDialog.show_message(self, "错误", f"源目录不存在: {self.source_dir}")
+            return
+
+        if not self.target_dir:
+            CardMessageDialog.show_message(self, "错误", "目标目录未设置")
+            return
+
+        if not os.path.exists(self.target_dir):
+            try:
+                os.makedirs(self.target_dir, exist_ok=True)
+            except Exception as e:
+                CardMessageDialog.show_message(self, "错误", f"无法创建目标目录: {e}")
+                return
+
+        # 按钮状态
+        self._current_action = "移动"
+        self.btn_start.setEnabled(False)
+        self.btn_move.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("暂停")
+        self.btn_stop.setEnabled(True)
+
+        # 初始化进度显示
+        self.overall_bar.setValue(0)
+        self.overall_label.setText("整体进度：0%")
+        self.file_progress.setValue(0)
+        self.file_progress_label.setText("文件进度：0%")
+        self.current_file_label.setText("当前文件：正在启动...")
+        self.status_label.setText("状态消息：移动中...")
+        self.speed_label.setText("当前速度：0 B/s")
+
+        self.manager = FileCopyManager(
+            self.source_dir, self.target_dir, self.config.get("detection_mode", DEFAULT_DETECTION_MODE)
+        )
+
+        self.copy_thread = threading.Thread(
+            target=self._move_thread_func,
+            daemon=True,
+        )
+        self.copy_thread.start()
+
+    def _move_thread_func(self):
+        """在后台线程中运行移动流程"""
+        if self.manager is not None:
+            self.manager.start_move(
+                progress_callback=self._update_progress,
+                status_callback=self._update_status,
+                file_progress_callback=self._update_file_progress,
+                complete_callback=self._copy_complete,
+                conflict_callback=self._ask_conflict_action,
+            )
+
     # 以下几个函数在子线程中被调用，只负责向队列塞消息，不直接操作 UI
     def _update_progress(self, value, text):
         self.queue.put(("progress", value, text))
@@ -1418,6 +1773,12 @@ class ModernWindow(QMainWindow):
 
     def _copy_complete(self, message):
         self.queue.put(("complete", message))
+
+    def _ask_conflict_action(self, source_file: str, target_file: str) -> str:
+        self._conflict_event.clear()
+        self.queue.put(("conflict", source_file, target_file))
+        self._conflict_event.wait()
+        return self._conflict_response or "cancel"
 
     # ---------- 在主线程中定时处理队列，更新 UI ----------
     def process_queue(self):
@@ -1464,11 +1825,12 @@ class ModernWindow(QMainWindow):
                 elif mtype == "complete":
                     msg_text = msg[1]
                     self.btn_start.setEnabled(True)
+                    self.btn_move.setEnabled(True)
                     self.btn_pause.setEnabled(False)
                     self.btn_pause.setText("暂停")
                     self.btn_stop.setEnabled(False)
 
-                    self.status_label.setText("状态消息：复制完成")
+                    self.status_label.setText(f"状态消息：{self._current_action}完成")
                     self.overall_bar.setValue(100)
                     self.overall_label.setText("整体进度：100%")
                     self.file_progress.setValue(100)
@@ -1478,6 +1840,26 @@ class ModernWindow(QMainWindow):
 
                     # 使用深色卡片式消息框替代默认白色提示框
                     CardMessageDialog.show_message(self, "完成", msg_text)
+                elif mtype == "conflict":
+                    source_file, target_file = msg[1], msg[2]
+                    text = (
+                        "目标已存在同名文件，请选择操作：\n\n"
+                        f"源文件：{source_file}\n"
+                        f"目标文件：{target_file}"
+                    )
+                    choice = CardChoiceDialog.ask(
+                        self,
+                        "文件已存在",
+                        text,
+                        [
+                            ("覆盖", "overwrite"),
+                            ("跳过", "skip"),
+                            ("重命名", "rename"),
+                            ("取消", "cancel"),
+                        ],
+                    )
+                    self._conflict_response = choice
+                    self._conflict_event.set()
 
         except queue.Empty:
             pass
@@ -1512,10 +1894,11 @@ class ModernWindow(QMainWindow):
         """停止按钮"""
         if not self.manager:
             return
-        if not CardQuestionDialog.ask(self, "确认", "确定要停止复制吗？"):
+        if not CardQuestionDialog.ask(self, "确认", "确定要停止当前任务吗？"):
             return
         self.manager.stop_flag = True
         self.btn_start.setEnabled(True)
+        self.btn_move.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("暂停")
         self.btn_stop.setEnabled(False)
