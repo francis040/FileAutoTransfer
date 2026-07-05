@@ -7,6 +7,7 @@ __pycache__/
 venv/
 .env/
 .venv/
+.venv_*/
 
 # 编辑器配置
 .vscode/
