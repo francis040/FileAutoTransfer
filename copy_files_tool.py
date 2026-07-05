@@ -1054,7 +1054,7 @@ class ModernWindow(QMainWindow):
     # ---------- 窗口基础设置 ----------
 
     def _setup_window_flags(self):
-        self.setWindowTitle("文件增量复制工具 v2.0 - Modern Dark")
+        self.setWindowTitle("文件传输助手")
         self.resize(820, 640)
 
         # 无边框 + 允许出现在任务栏
@@ -1260,7 +1260,7 @@ class ModernWindow(QMainWindow):
         t_layout.setSpacing(8)
 
         # 左侧：标题文本（固定左上角）
-        title_label = QLabel("文件增量复制工具 v2.0")
+        title_label = QLabel("文件传输助手")
         title_label.setObjectName("titleLabel")
         t_layout.addWidget(title_label)
         t_layout.addStretch()
