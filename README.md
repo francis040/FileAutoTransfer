@@ -37,6 +37,16 @@
 
 ---
 
+### 🚫 排除文件与文件夹
+适合 BitComet 做种等场景，可在移动/复制时跳过指定内容：
+
+- 排除单个文件
+- 排除源目录下的某个文件夹及所有下层内容
+- 排除规则跟随传输组保存
+- 已删除或暂时不存在的排除项会保留，不影响任务运行
+
+---
+
 ### 🪟 自定义深色弹窗
 内置三种深色卡片式弹窗组件：
 
@@ -114,11 +124,23 @@ python copy_files_tool.py
   "target_dir": "W:/XXX/XXX",
   "detection_mode": "fast",
   "delete_after_copy": false,
+  "exclude_items": [
+    {
+      "type": "folder",
+      "path": "正在做种"
+    }
+  ],
   "presets": [
     {
       "name": "XXX",
       "source": "X:/XXX",
-      "target": "X:/XXX/XXX"
+      "target": "X:/XXX/XXX",
+      "exclude_items": [
+        {
+          "type": "file",
+          "path": "example.mkv"
+        }
+      ]
     }
   ]
 }

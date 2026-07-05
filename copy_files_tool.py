@@ -43,7 +43,11 @@ class ConfigManager:
                 cfg.setdefault("delete_after_copy", False)
                 cfg.setdefault("source_dir", DEFAULT_SOURCE_DIR)
                 cfg.setdefault("target_dir", DEFAULT_TARGET_DIR)
+                cfg.setdefault("exclude_items", [])
                 cfg.setdefault("presets", [])
+                for preset in cfg["presets"]:
+                    if isinstance(preset, dict):
+                        preset.setdefault("exclude_items", [])
                 return cfg
             except Exception:
                 pass
@@ -53,6 +57,7 @@ class ConfigManager:
             "target_dir": DEFAULT_TARGET_DIR,
             "detection_mode": DEFAULT_DETECTION_MODE,
             "delete_after_copy": False,
+            "exclude_items": [],
             "presets": [],
         }
 
@@ -77,7 +82,7 @@ class FileCopyManager:
     - complete_callback(最终总结文本)
     """
 
-    def __init__(self, source_dir, target_dir, detection_mode=DEFAULT_DETECTION_MODE):
+    def __init__(self, source_dir, target_dir, detection_mode=DEFAULT_DETECTION_MODE, exclude_items=None):
         self.pause_flag = False       # 控制“暂停”的标志位（由 UI 改）
         self.stop_flag = False        # 控制“停止”的标志位（由 UI 改）
         self.delete_after_copy = False  # 是否复制后删除源文件（由 UI 改）
@@ -85,6 +90,8 @@ class FileCopyManager:
         self.source_dir = source_dir
         self.target_dir = target_dir
         self.detection_mode = detection_mode or DEFAULT_DETECTION_MODE
+        self.exclude_items = self._normalize_exclude_items(exclude_items or [])
+        self.last_excluded_count = 0
 
         self.hash_db = self.load_hash_db()
 
@@ -129,7 +136,11 @@ class FileCopyManager:
         """追加一行日志到日志文件，同时 print 出来"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] {message}"
-        print(line)
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            encoding = sys.stdout.encoding or "utf-8"
+            print(line.encode(encoding, errors="replace").decode(encoding, errors="replace"))
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -137,12 +148,68 @@ class FileCopyManager:
             # 日志写失败不影响主流程
             pass
 
+    def _normalize_rel_path(self, rel_path: str) -> str:
+        """把相对路径统一成适合比较的格式"""
+        rel_path = (rel_path or "").strip().replace("/", os.sep).replace("\\", os.sep)
+        rel_path = os.path.normpath(rel_path).strip(os.sep)
+        if rel_path in ("", "."):
+            return ""
+        return os.path.normcase(rel_path)
+
+    def _normalize_exclude_items(self, items):
+        """整理排除列表，只保留可识别的文件/文件夹规则"""
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            rel_path = self._normalize_rel_path(item.get("path", ""))
+            if item_type not in ("file", "folder") or not rel_path:
+                continue
+            normalized.append({"type": item_type, "path": rel_path})
+        return normalized
+
+    def is_excluded_path(self, file_path: str, is_dir: bool = False) -> bool:
+        """判断某个源目录内路径是否命中排除规则"""
+        try:
+            rel_path = os.path.relpath(file_path, self.source_dir)
+        except Exception:
+            return False
+        rel_path = self._normalize_rel_path(rel_path)
+        if not rel_path:
+            return False
+
+        for item in self.exclude_items:
+            exclude_path = item["path"]
+            if item["type"] == "file":
+                if not is_dir and rel_path == exclude_path:
+                    return True
+            elif item["type"] == "folder":
+                if rel_path == exclude_path or rel_path.startswith(exclude_path + os.sep):
+                    return True
+        return False
+
     def get_all_files(self, directory: str):
-        """递归获取目录下所有文件的绝对路径"""
+        """递归获取目录下所有未被排除的文件绝对路径"""
         files = []
+        excluded = 0
         for root, dirs, filenames in os.walk(directory):
+            kept_dirs = []
+            for name in dirs:
+                dir_path = os.path.join(root, name)
+                if self.is_excluded_path(dir_path, is_dir=True):
+                    excluded += 1
+                else:
+                    kept_dirs.append(name)
+            dirs[:] = kept_dirs
+
             for name in filenames:
-                files.append(os.path.join(root, name))
+                file_path = os.path.join(root, name)
+                if self.is_excluded_path(file_path):
+                    excluded += 1
+                    continue
+                files.append(file_path)
+        self.last_excluded_count = excluded
         return files
 
     def _same_drive(self, path_a: str, path_b: str) -> bool:
@@ -160,6 +227,29 @@ class FileCopyManager:
             if not os.path.exists(candidate):
                 return candidate
             index += 1
+
+    def _file_snapshot(self, file_path: str):
+        """记录文件大小和修改时间，用于检测传输过程中的变化"""
+        try:
+            stat = os.stat(file_path)
+            return stat.st_size, stat.st_mtime_ns
+        except Exception:
+            return None
+
+    def _source_changed(self, file_path: str, snapshot) -> bool:
+        """判断源文件是否被删除或发生变化"""
+        if snapshot is None:
+            return True
+        return self._file_snapshot(file_path) != snapshot
+
+    def _remove_target_file(self, target_file: str, reason: str):
+        """删除不完整或不可信的目标文件"""
+        try:
+            if os.path.isfile(target_file):
+                os.remove(target_file)
+                self.log(f"{reason}: {target_file}")
+        except Exception as e:
+            self.log(f"删除目标文件失败: {target_file} - {e}")
 
     # ---------- 判定是否需要复制 ----------
 
@@ -210,7 +300,11 @@ class FileCopyManager:
             # 确保目标目录存在
             os.makedirs(os.path.dirname(target_file), exist_ok=True)
 
-            file_size = os.path.getsize(source_file)
+            source_snapshot = self._file_snapshot(source_file)
+            if source_snapshot is None:
+                return "skipped", "源文件不存在，已跳过"
+
+            file_size = source_snapshot[0]
             chunk_size = 4 * 1024 * 1024  # 4MB 一块，适配网络盘
 
             # 检查目标是否已经存在（可能是部分文件）
@@ -336,6 +430,10 @@ class FileCopyManager:
                 except Exception:
                     pass
 
+                if self._source_changed(source_file, source_snapshot):
+                    self._remove_target_file(target_file, "源文件传输过程中已变化，已删除目标文件")
+                    return "skipped", "源文件已变化，已跳过"
+
                 # 尝试复制时间戳等元数据
                 try:
                     shutil.copystat(source_file, target_file)
@@ -396,9 +494,15 @@ class FileCopyManager:
                     src.close()
                 except Exception:
                     pass
+                if not os.path.exists(source_file):
+                    self._remove_target_file(target_file, "源文件传输过程中被删除，已删除目标文件")
+                    return "skipped", "源文件被删除，已跳过"
                 return False, str(e)
 
         except Exception as e:
+            if not os.path.exists(source_file):
+                self._remove_target_file(target_file, "源文件不可用，已删除目标文件")
+                return "skipped", "源文件不存在，已跳过"
             return False, str(e)
 
     # ---------- 整体复制流程（在独立线程中运行） ----------
@@ -424,11 +528,16 @@ class FileCopyManager:
         total = len(files)
 
         if total == 0:
-            self.log("源目录中没有文件")
-            complete_callback("源目录中没有文件")
+            msg = "源目录中没有可处理的文件"
+            if self.last_excluded_count:
+                msg += f"（已排除 {self.last_excluded_count} 项）"
+            self.log(msg)
+            complete_callback(msg)
             return
 
-        self.log(f"找到 {total} 个文件")
+        self.log(f"找到 {total} 个可处理文件")
+        if self.last_excluded_count:
+            self.log(f"已排除 {self.last_excluded_count} 项")
 
         copied = 0
         skipped = 0
@@ -454,6 +563,18 @@ class FileCopyManager:
             status_callback(f"处理中: {file_name}", source_file)
             progress_callback(int(index * 100 / total), f"{index}/{total}")
 
+            if self.is_excluded_path(source_file):
+                self.log(f"⊘ 跳过: {rel_path} (已排除)")
+                file_progress_callback(100, file_name, "⊘ 已排除", 0)
+                skipped += 1
+                continue
+
+            if not os.path.exists(source_file):
+                self.log(f"⊘ 跳过: {rel_path} (源文件不存在)")
+                file_progress_callback(100, file_name, "⊘ 源文件不存在", 0)
+                skipped += 1
+                continue
+
             should_copy, reason = self.should_copy_file(source_file, target_file)
             file_progress_callback(0, file_name, reason, 0)
 
@@ -471,6 +592,10 @@ class FileCopyManager:
                     self.log(f"⟲ 已取消: {rel_path} - {msg}")
                     file_progress_callback(0, file_name, "⟲ 已取消", 0)
                     # 这里不计入失败，交给外层逻辑处理 stop_flag
+                elif success == "skipped":
+                    self.log(f"⊘ 跳过: {rel_path} - {msg}")
+                    file_progress_callback(100, file_name, f"⊘ {msg}", 0)
+                    skipped += 1
                 else:
                     self.log(f"✗ 失败: {rel_path} - {msg}")
                     file_progress_callback(0, file_name, f"✗ 失败: {msg}", 0)
@@ -518,11 +643,16 @@ class FileCopyManager:
         total = len(files)
 
         if total == 0:
-            self.log("源目录中没有文件")
-            complete_callback("源目录中没有文件")
+            msg = "源目录中没有可处理的文件"
+            if self.last_excluded_count:
+                msg += f"（已排除 {self.last_excluded_count} 项）"
+            self.log(msg)
+            complete_callback(msg)
             return
 
-        self.log(f"找到 {total} 个文件")
+        self.log(f"找到 {total} 个可处理文件")
+        if self.last_excluded_count:
+            self.log(f"已排除 {self.last_excluded_count} 项")
 
         moved = 0
         skipped = 0
@@ -546,6 +676,18 @@ class FileCopyManager:
             status_callback(f"处理中: {file_name}", source_file)
             progress_callback(int(index * 100 / total), f"{index}/{total}")
             file_progress_callback(0, file_name, "移动中", 0)
+
+            if self.is_excluded_path(source_file):
+                self.log(f"≈ 跳过: {rel_path} (已排除)")
+                file_progress_callback(100, file_name, "已排除", 0)
+                skipped += 1
+                continue
+
+            if not os.path.exists(source_file):
+                self.log(f"≈ 跳过: {rel_path} (源文件不存在)")
+                file_progress_callback(100, file_name, "源文件不存在", 0)
+                skipped += 1
+                continue
 
             if os.path.exists(target_file):
                 action = conflict_callback(source_file, target_file)
@@ -574,6 +716,11 @@ class FileCopyManager:
 
             if self._same_drive(source_file, target_file):
                 try:
+                    if not os.path.exists(source_file):
+                        self.log(f"≈ 跳过: {rel_path} (源文件不存在)")
+                        file_progress_callback(100, file_name, "源文件不存在", 0)
+                        skipped += 1
+                        continue
                     os.replace(source_file, target_file)
                     self.log(f"⇄ 移动: {rel_path}")
                     file_progress_callback(100, file_name, "移动完成", 0)
@@ -612,6 +759,10 @@ class FileCopyManager:
                 elif success is None:
                     self.log(f"⟲ 已取消: {rel_path} - {msg}")
                     file_progress_callback(0, file_name, "已取消", 0)
+                elif success == "skipped":
+                    self.log(f"≈ 跳过: {rel_path} - {msg}")
+                    file_progress_callback(100, file_name, msg, 0)
+                    skipped += 1
                 else:
                     self.log(f"! 失败: {rel_path} - {msg}")
                     file_progress_callback(0, file_name, f"失败: {msg}", 0)
@@ -962,6 +1113,7 @@ class PresetManagerDialog(QWidget):
             "name": name.strip(),
             "source": src,
             "target": dst,
+            "exclude_items": [],
         }
         self.presets.append(preset)
         ConfigManager.save_config(self.config)
@@ -1007,6 +1159,171 @@ class PresetManagerDialog(QWidget):
             self.close()
 
 
+class ExcludeManagerDialog(QWidget):
+    """排除项管理器弹窗"""
+
+    def __init__(self, parent, config: dict, exclude_items: list, source_dir: str):
+        super().__init__(parent)
+        self.setWindowTitle("排除项管理")
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.resize(560, 340)
+
+        self.config = config
+        self.exclude_items = exclude_items
+        self.source_dir = source_dir or ""
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame()
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 16, 16, 16)
+        card_layout.setSpacing(10)
+
+        title = QLabel("排除项管理")
+        title.setObjectName("sectionTitle")
+        title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        card_layout.addWidget(title)
+
+        source_label = QLabel(f"源目录: {self.source_dir or '未选择'}")
+        source_label.setStyleSheet("color:#9bd5ff;")
+        source_label.setWordWrap(True)
+        card_layout.addWidget(source_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["类型", "相对路径", "状态"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        card_layout.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+        btn_add_file = QPushButton("添加文件")
+        btn_add_file.clicked.connect(self.add_file)
+        btn_add_folder = QPushButton("添加文件夹")
+        btn_add_folder.clicked.connect(self.add_folder)
+        btn_delete = QPushButton("删除选中")
+        btn_delete.clicked.connect(self.delete_current)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.close)
+
+        btn_row.addWidget(btn_add_file)
+        btn_row.addWidget(btn_add_folder)
+        btn_row.addWidget(btn_delete)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        card_layout.addLayout(btn_row)
+
+        outer_layout.addWidget(card)
+        self._refresh_table()
+
+    def _absolute_source_dir(self):
+        if not self.source_dir:
+            return ""
+        return os.path.abspath(self.source_dir)
+
+    def _to_relative_source_path(self, path: str):
+        source_dir = self._absolute_source_dir()
+        if not source_dir:
+            return None
+        try:
+            abs_path = os.path.abspath(path)
+            source_norm = os.path.normcase(source_dir)
+            path_norm = os.path.normcase(abs_path)
+            if os.path.commonpath([source_norm, path_norm]) != source_norm:
+                return None
+            rel_path = os.path.relpath(abs_path, source_dir)
+            if rel_path in ("", "."):
+                return None
+            return os.path.normpath(rel_path)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _same_rule(a: dict, b: dict) -> bool:
+        return (
+            a.get("type") == b.get("type")
+            and os.path.normcase(os.path.normpath(a.get("path", "")))
+            == os.path.normcase(os.path.normpath(b.get("path", "")))
+        )
+
+    def _item_status(self, item: dict) -> str:
+        if not self.source_dir or not os.path.exists(self.source_dir):
+            return "源目录不存在"
+        abs_path = os.path.join(self.source_dir, item.get("path", ""))
+        if item.get("type") == "folder":
+            return "存在" if os.path.isdir(abs_path) else "未找到"
+        return "存在" if os.path.isfile(abs_path) else "未找到"
+
+    def _refresh_table(self):
+        self.table.setRowCount(0)
+        for row, item in enumerate(self.exclude_items):
+            self.table.insertRow(row)
+            type_text = "文件夹" if item.get("type") == "folder" else "文件"
+            self.table.setItem(row, 0, QTableWidgetItem(type_text))
+            self.table.setItem(row, 1, QTableWidgetItem(item.get("path", "")))
+            self.table.setItem(row, 2, QTableWidgetItem(self._item_status(item)))
+        if self.exclude_items:
+            self.table.selectRow(0)
+
+    def _save_and_refresh(self):
+        ConfigManager.save_config(self.config)
+        self._refresh_table()
+        parent = self.parent()
+        if hasattr(parent, "update_exclude_summary"):
+            parent.update_exclude_summary()
+
+    def _add_item(self, item_type: str, path: str):
+        rel_path = self._to_relative_source_path(path)
+        if not rel_path:
+            CardMessageDialog.show_message(self, "提示", "请选择源目录内部的文件或文件夹。")
+            return
+
+        item = {"type": item_type, "path": rel_path}
+        if any(self._same_rule(existing, item) for existing in self.exclude_items):
+            CardMessageDialog.show_message(self, "提示", "这个排除项已经存在。")
+            return
+
+        self.exclude_items.append(item)
+        self._save_and_refresh()
+
+    def add_file(self):
+        if not self.source_dir or not os.path.exists(self.source_dir):
+            CardMessageDialog.show_message(self, "错误", "请先选择有效的源目录。")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "选择要排除的文件", self.source_dir)
+        if path:
+            self._add_item("file", path)
+
+    def add_folder(self):
+        if not self.source_dir or not os.path.exists(self.source_dir):
+            CardMessageDialog.show_message(self, "错误", "请先选择有效的源目录。")
+            return
+        path = QFileDialog.getExistingDirectory(self, "选择要排除的文件夹", self.source_dir)
+        if path:
+            self._add_item("folder", path)
+
+    def delete_current(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.exclude_items):
+            return
+        item = self.exclude_items[row]
+        if not CardQuestionDialog.ask(self, "确认删除", f"确定要删除排除项：{item.get('path', '')} ？"):
+            return
+        self.exclude_items.pop(row)
+        self._save_and_refresh()
+
+
 class ModernWindow(QMainWindow):
     """PySide6 深色玻璃 UI"""
 
@@ -1017,6 +1334,7 @@ class ModernWindow(QMainWindow):
         self.config = ConfigManager.load_config()
         self.source_dir = self.config.get("source_dir", DEFAULT_SOURCE_DIR)
         self.target_dir = self.config.get("target_dir", DEFAULT_TARGET_DIR)
+        self.current_preset = self._find_matching_preset()
         self.manager: Optional[FileCopyManager] = None
         self.copy_thread: Optional[threading.Thread] = None
 
@@ -1040,6 +1358,7 @@ class ModernWindow(QMainWindow):
         self._min_height = 450
 
         self._preset_dialog: Optional[PresetManagerDialog] = None
+        self._exclude_dialog: Optional[ExcludeManagerDialog] = None
 
         # --- UI 初始化 ---
         self._setup_window_flags()
@@ -1313,6 +1632,16 @@ class ModernWindow(QMainWindow):
         self.btn_manage_presets.clicked.connect(self.open_preset_manager)
         cfg_layout.addWidget(self.btn_manage_presets)
 
+        exclude_row = QHBoxLayout()
+        self.lbl_exclude_count = QLabel("排除项：0 项")
+        self.lbl_exclude_count.setStyleSheet("color:#d0d0d0;")
+        self.btn_manage_excludes = QPushButton("管理排除项")
+        self.btn_manage_excludes.setFixedWidth(110)
+        self.btn_manage_excludes.clicked.connect(self.open_exclude_manager)
+        exclude_row.addWidget(self.lbl_exclude_count)
+        exclude_row.addStretch()
+        exclude_row.addWidget(self.btn_manage_excludes)
+
         # 源目录
         row1 = QHBoxLayout()
         lbl_src = QLabel("源目录：")
@@ -1361,7 +1690,9 @@ class ModernWindow(QMainWindow):
         cfg_layout.addLayout(row1)
         cfg_layout.addLayout(row2)
         cfg_layout.addLayout(row3)
+        cfg_layout.addLayout(exclude_row)
         cfg_layout.addWidget(lbl_log)
+        self.update_exclude_summary()
 
         # === 状态卡片 ===
         status_card = QFrame()
@@ -1587,6 +1918,36 @@ class ModernWindow(QMainWindow):
 
     # ---------- 配置项改变 & 传输组管理 ----------
 
+    @staticmethod
+    def _same_path(path_a: str, path_b: str) -> bool:
+        try:
+            return os.path.normcase(os.path.abspath(path_a or "")) == os.path.normcase(os.path.abspath(path_b or ""))
+        except Exception:
+            return (path_a or "") == (path_b or "")
+
+    def _find_matching_preset(self):
+        """启动时如果当前源/目标正好匹配某个传输组，就把它作为当前传输组"""
+        for preset in self.config.get("presets", []):
+            if not isinstance(preset, dict):
+                continue
+            if (
+                self._same_path(self.source_dir, preset.get("source", ""))
+                and self._same_path(self.target_dir, preset.get("target", ""))
+            ):
+                preset.setdefault("exclude_items", [])
+                return preset
+        return None
+
+    def _get_exclude_items(self):
+        if self.current_preset is not None:
+            return self.current_preset.setdefault("exclude_items", [])
+        return self.config.setdefault("exclude_items", [])
+
+    def update_exclude_summary(self):
+        count = len(self._get_exclude_items())
+        if hasattr(self, "lbl_exclude_count"):
+            self.lbl_exclude_count.setText(f"排除项：{count} 项")
+
     def open_preset_manager(self):
         """打开传输组管理器"""
         if self._preset_dialog is None or not self._preset_dialog.isVisible():
@@ -1602,8 +1963,26 @@ class ModernWindow(QMainWindow):
             self._preset_dialog.raise_()
             self._preset_dialog.activateWindow()
 
+    def open_exclude_manager(self):
+        """打开排除项管理器"""
+        exclude_items = self._get_exclude_items()
+        if self._exclude_dialog is None or not self._exclude_dialog.isVisible():
+            self._exclude_dialog = ExcludeManagerDialog(
+                self, self.config, exclude_items, self.source_dir
+            )
+            geo = self.frameGeometry()
+            dlg_geo = self._exclude_dialog.frameGeometry()
+            dlg_geo.moveCenter(geo.center())
+            self._exclude_dialog.move(dlg_geo.topLeft())
+            self._exclude_dialog.show()
+        else:
+            self._exclude_dialog.raise_()
+            self._exclude_dialog.activateWindow()
+
     def apply_preset(self, preset: dict):
         """把一个传输组应用到主界面"""
+        self.current_preset = preset
+        self.current_preset.setdefault("exclude_items", [])
         self.source_dir = preset.get("source", "") or ""
         self.target_dir = preset.get("target", "") or ""
         self.lbl_src_path.setText(self.source_dir or "未选择")
@@ -1611,26 +1990,31 @@ class ModernWindow(QMainWindow):
         self.config["source_dir"] = self.source_dir
         self.config["target_dir"] = self.target_dir
         ConfigManager.save_config(self.config)
+        self.update_exclude_summary()
 
     def select_source_dir(self):
         path = QFileDialog.getExistingDirectory(
             self, "选择源目录", self.source_dir or ""
         )
         if path:
+            self.current_preset = None
             self.source_dir = path
             self.lbl_src_path.setText(path)
             self.config["source_dir"] = path
             ConfigManager.save_config(self.config)
+            self.update_exclude_summary()
 
     def select_target_dir(self):
         path = QFileDialog.getExistingDirectory(
             self, "选择目标目录", self.target_dir or ""
         )
         if path:
+            self.current_preset = None
             self.target_dir = path
             self.lbl_dst_path.setText(path)
             self.config["target_dir"] = path
             ConfigManager.save_config(self.config)
+            self.update_exclude_summary()
 
     def on_mode_changed(self, mode: str):
         self.config["detection_mode"] = mode
@@ -1682,7 +2066,7 @@ class ModernWindow(QMainWindow):
 
         # 创建 FileCopyManager，并把配置传进去
         self.manager = FileCopyManager(
-            self.source_dir, self.target_dir, detection_mode
+            self.source_dir, self.target_dir, detection_mode, self._get_exclude_items()
         )
         delete_after = self.chk_delete_after.isChecked()
         self.manager.delete_after_copy = delete_after
@@ -1741,7 +2125,10 @@ class ModernWindow(QMainWindow):
         self.speed_label.setText("当前速度：0 B/s")
 
         self.manager = FileCopyManager(
-            self.source_dir, self.target_dir, self.config.get("detection_mode", DEFAULT_DETECTION_MODE)
+            self.source_dir,
+            self.target_dir,
+            self.config.get("detection_mode", DEFAULT_DETECTION_MODE),
+            self._get_exclude_items(),
         )
 
         self.copy_thread = threading.Thread(
